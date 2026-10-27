@@ -23,7 +23,9 @@ from gridpilot import (
     BatteryConfig,
     generate_synthetic_commercial_profiles,
     get_scenario_definitions,
+    get_tariff_preset,
     optimize_building_dispatch,
+    validate_custom_tariff,
 )
 
 st.set_page_config(
@@ -65,7 +67,7 @@ def apply_chart_style(figure: go.Figure, height: int) -> go.Figure:
 @st.cache_data(show_spinner=False)
 def run_scenario_cached(
     solar_scale: float,
-    price_regime: str,
+    price_inr_per_kwh: tuple[float, ...],
     capacity_kwh: float,
     power_kw: float,
     initial_soc_kwh: float,
@@ -74,8 +76,17 @@ def run_scenario_cached(
     charge_efficiency: float,
     discharge_efficiency: float,
 ) -> dict[str, Any]:
-    """Build a synthetic 24h profile and solve the least-cost dispatch for it."""
-    profile = generate_synthetic_commercial_profiles(solar_scale=solar_scale, price_regime=price_regime)
+    """Build a synthetic 24h profile and solve the least-cost dispatch for it.
+
+    ``price_inr_per_kwh`` is an explicit 24-value hourly tariff (INR/kWh) —
+    it may come from a built-in preset or from the custom tariff editor, and
+    is passed straight through to the optimizer without being limited to any
+    fixed set of rate structures.
+    """
+    profile = generate_synthetic_commercial_profiles(
+        solar_scale=solar_scale,
+        custom_price_inr_per_kwh=price_inr_per_kwh,
+    )
     battery = BatteryConfig(
         capacity_kwh=capacity_kwh,
         max_charge_kw=power_kw if capacity_kwh else 0.0,
@@ -278,6 +289,7 @@ with st.sidebar:
         price_regime = "flat" if scenario_key == "flat_electricity_prices" else (
             "high_evening" if scenario_key == "high_evening_prices" else "normal_tou"
         )
+        price_inr_per_kwh = tuple(get_tariff_preset(price_regime).tolist())
         capacity_kwh = preset_battery.capacity_kwh
         power_kw = preset_battery.max_charge_kw
         initial_soc_kwh = preset_battery.initial_soc_kwh
@@ -287,16 +299,67 @@ with st.sidebar:
         discharge_efficiency = preset_battery.discharge_efficiency
     else:
         st.header("2. Building & tariff", icon=":material/apartment:")
-        price_regime = st.selectbox(
-            "Tariff regime",
+        solar_scale = st.slider("Solar system scale", 0.0, 1.5, 1.0, 0.1, help="1.0 = reference 120 kWp rooftop system.")
+
+        st.subheader("Electricity tariff (INR/kWh)", icon=":material/payments:")
+        st.caption(
+            "Enter your own hourly rate for every hour of the day — this is not limited to the three "
+            "built-in presets. Real DISCOM tariffs vary by state, consumer category, and revision, so "
+            "edit every value below to match your actual bill or any tariff you want to test."
+        )
+        start_from = st.selectbox(
+            "Pre-fill the table from",
             ["normal_tou", "flat", "high_evening"],
             format_func=lambda r: {
-                "normal_tou": "Indian C&I Time-of-Use (normal)",
-                "flat": "Flat ₹8.0/kWh all day",
-                "high_evening": "High evening peak (₹18.0/kWh, 6–10 PM)",
+                "normal_tou": "Indian C&I Time-of-Use (normal) — editable starting point",
+                "flat": "Flat ₹8.0/kWh all day — editable starting point",
+                "high_evening": "High evening peak (₹18.0/kWh, 6–10 PM) — editable starting point",
             }[r],
+            help="Choosing a different pre-fill resets the table below to that preset. "
+            "Your own edits are kept until you change this.",
         )
-        solar_scale = st.slider("Solar system scale", 0.0, 1.5, 1.0, 0.1, help="1.0 = reference 120 kWp rooftop system.")
+        if st.session_state.get("_tariff_prefill_source") != start_from:
+            st.session_state["_tariff_prefill_source"] = start_from
+            st.session_state["_tariff_prefill_df"] = pd.DataFrame(
+                {
+                    "hour": np.arange(24, dtype=int),
+                    "price_inr_per_kwh": get_tariff_preset(start_from),
+                }
+            )
+
+        edited_tariff_df = st.data_editor(
+            st.session_state["_tariff_prefill_df"],
+            key="tariff_editor",
+            hide_index=True,
+            width="stretch",
+            num_rows="fixed",
+            column_config={
+                "hour": st.column_config.NumberColumn("Hour", disabled=True, format="%d:00"),
+                "price_inr_per_kwh": st.column_config.NumberColumn(
+                    "Price (₹/kWh)", min_value=0.0, max_value=100.0, step=0.1, format="₹%.2f"
+                ),
+            },
+        )
+
+        try:
+            price_inr_per_kwh = tuple(
+                validate_custom_tariff(edited_tariff_df["price_inr_per_kwh"].to_numpy()).tolist()
+            )
+        except ValueError as tariff_error:
+            st.error(f"Invalid tariff: {tariff_error}. Using the last valid tariff instead.", icon=":material/error:")
+            price_inr_per_kwh = tuple(get_tariff_preset(start_from).tolist())
+
+        with st.expander("Preview tariff curve", icon=":material/show_chart:"):
+            tariff_figure = go.Figure(
+                go.Scatter(
+                    x=list(range(24)), y=list(price_inr_per_kwh), mode="lines+markers",
+                    line={"color": COLORS["violet"], "width": 2.5},
+                    hovertemplate="Hour %{x}: ₹%{y:.2f}/kWh<extra></extra>",
+                )
+            )
+            tariff_figure.update_xaxes(title_text="Hour of day", dtick=2)
+            tariff_figure.update_yaxes(title_text="₹/kWh")
+            st.plotly_chart(apply_chart_style(tariff_figure, height=220), width="stretch", config=PLOTLY_CONFIG)
 
         st.header("3. Battery", icon=":material/battery_charging_full:")
         capacity_kwh = st.number_input("Battery capacity (kWh)", min_value=0.0, max_value=2000.0, value=200.0, step=10.0)
@@ -319,7 +382,7 @@ with st.sidebar:
 
 result = run_scenario_cached(
     solar_scale,
-    price_regime,
+    price_inr_per_kwh,
     capacity_kwh,
     power_kw,
     initial_soc_kwh,

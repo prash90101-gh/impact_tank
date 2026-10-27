@@ -12,7 +12,7 @@ demonstration.
 """
 
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
@@ -93,6 +93,7 @@ def generate_synthetic_commercial_profiles(
     hours: int = 24,
     solar_scale: float = 1.0,
     price_regime: str = "normal_tou",
+    custom_price_inr_per_kwh: Optional[Sequence[float]] = None,
 ) -> pd.DataFrame:
     """
     Generate a 24-hour SYNTHETIC commercial building dataset aligned with Indian C&I
@@ -106,7 +107,15 @@ def generate_synthetic_commercial_profiles(
     solar_scale : float
         Multiplier for solar PV generation (1.0 = normal 120 kWp system, 0.0 = no solar).
     price_regime : str
-        One of {'normal_tou', 'flat', 'high_evening'}.
+        One of {'normal_tou', 'flat', 'high_evening', 'custom'}. Ignored if
+        ``custom_price_inr_per_kwh`` is provided (the regime is then forced to
+        'custom').
+    custom_price_inr_per_kwh : Sequence[float], optional
+        A user-supplied hourly tariff (INR/kWh) of length ``hours``. When
+        provided, this fully overrides ``price_regime`` so a real or
+        hypothetical DISCOM tariff can be entered directly instead of being
+        limited to the three built-in presets. See ``validate_custom_tariff``
+        for the validation rules applied to this input.
 
     Returns
     -------
@@ -117,57 +126,114 @@ def generate_synthetic_commercial_profiles(
     if hours != 24:
         raise ValueError("Synthetic profile generator currently supports a 24-hour horizon.")
 
-    hour_idx = np.arange(hours, dtype=int)
-
-    # Synthetic Commercial Building Hourly Demand (kWh)
-    # Represents a medium commercial office/retail facility in India:
-    # - Base overnight load (security, servers, chillers standby): ~35-42 kWh
-    # - Daytime commercial operations (HVAC, lighting, equipment): ~95-120 kWh
-    # - Evening lighting/retail/HVAC peak (18:00 - 22:00): up to 135 kWh
-    demand_kwh = np.array([
-        38.0, 36.0, 35.0, 35.0, 37.0, 42.0,   # 00:00 - 05:00 (Off-peak night)
-        55.0, 72.0, 92.0, 108.0, 115.0, 118.0, # 06:00 - 11:00 (Morning ramp & office hours)
-        112.0, 110.0, 114.0, 116.0, 120.0, 128.0, # 12:00 - 17:00 (Afternoon commercial load)
-        135.0, 132.0, 122.0, 105.0, 70.0, 48.0    # 18:00 - 23:00 (6 PM - 10 PM evening peak & ramp down)
-    ], dtype=float)
-
-    # Synthetic Rooftop Solar Generation (kWh)
-    # Peaks between 10:00 and 16:00, creating midday surplus/offset potential
-    base_solar_kwh = np.array([
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,         # 00:00 - 05:00
-        3.0, 18.0, 48.0, 82.0, 115.0, 135.0,  # 06:00 - 11:00
-        142.0, 138.0, 122.0, 95.0, 52.0, 15.0, # 12:00 - 17:00
-        2.0, 0.0, 0.0, 0.0, 0.0, 0.0          # 18:00 - 23:00
-    ], dtype=float)
-    solar_kwh = np.maximum(0.0, base_solar_kwh * float(solar_scale))
-
-    # Synthetic Indian C&I Time-of-Day (ToD / ToU) Tariff (INR / kWh)
-    if price_regime == "normal_tou":
-        # Night off-peak: INR 5.5/kWh | Morning/Day normal: INR 8.0/kWh | Solar valley (10-15): INR 6.5/kWh | Evening peak (18-22): INR 12.5/kWh
-        price_inr = np.array([
-            5.5, 5.5, 5.5, 5.5, 5.5, 5.5,     # 00:00 - 05:00
-            8.0, 8.0, 8.0, 8.0, 6.5, 6.5,     # 06:00 - 11:00
-            6.5, 6.5, 6.5, 8.0, 8.0, 8.0,     # 12:00 - 17:00
-            12.5, 12.5, 12.5, 12.5, 8.0, 5.5  # 18:00 - 23:00 (18:00-21:59 peak)
-        ], dtype=float)
-    elif price_regime == "flat":
-        price_inr = np.full(hours, 8.0, dtype=float)
-    elif price_regime == "high_evening":
-        # Extreme evening peak stress tariff (INR 18.0/kWh during 18:00 - 21:59)
-        price_inr = np.array([
-            5.5, 5.5, 5.5, 5.5, 5.5, 5.5,
-            8.0, 8.0, 8.0, 8.0, 6.5, 6.5,
-            6.5, 6.5, 6.5, 8.0, 8.0, 9.0,
-            18.0, 18.0, 18.0, 18.0, 9.0, 5.5
-        ], dtype=float)
+    if custom_price_inr_per_kwh is not None:
+        price_inr = validate_custom_tariff(custom_price_inr_per_kwh, hours=hours)
     else:
-        raise ValueError(f"Unknown price_regime '{price_regime}'. Use 'normal_tou', 'flat', or 'high_evening'.")
+        price_inr = get_tariff_preset(price_regime, hours=hours)
+
+    return _build_profile_frame(hours=hours, solar_scale=solar_scale, price_inr_per_kwh=price_inr)
+
+
+# Synthetic Commercial Building Hourly Demand (kWh)
+# Represents a medium commercial office/retail facility in India:
+# - Base overnight load (security, servers, chillers standby): ~35-42 kWh
+# - Daytime commercial operations (HVAC, lighting, equipment): ~95-120 kWh
+# - Evening lighting/retail/HVAC peak (18:00 - 22:00): up to 135 kWh
+_DEMAND_KWH_24H = np.array([
+    38.0, 36.0, 35.0, 35.0, 37.0, 42.0,   # 00:00 - 05:00 (Off-peak night)
+    55.0, 72.0, 92.0, 108.0, 115.0, 118.0, # 06:00 - 11:00 (Morning ramp & office hours)
+    112.0, 110.0, 114.0, 116.0, 120.0, 128.0, # 12:00 - 17:00 (Afternoon commercial load)
+    135.0, 132.0, 122.0, 105.0, 70.0, 48.0    # 18:00 - 23:00 (6 PM - 10 PM evening peak & ramp down)
+], dtype=float)
+
+# Synthetic Rooftop Solar Generation (kWh)
+# Peaks between 10:00 and 16:00, creating midday surplus/offset potential
+_BASE_SOLAR_KWH_24H = np.array([
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,         # 00:00 - 05:00
+    3.0, 18.0, 48.0, 82.0, 115.0, 135.0,  # 06:00 - 11:00
+    142.0, 138.0, 122.0, 95.0, 52.0, 15.0, # 12:00 - 17:00
+    2.0, 0.0, 0.0, 0.0, 0.0, 0.0          # 18:00 - 23:00
+], dtype=float)
+
+# Built-in Indian C&I Time-of-Day (ToD / ToU) tariff presets (INR / kWh).
+# These remain available as quick-start defaults and as pre-fill values for
+# the custom tariff editor, but a user is never limited to only these three
+# fixed rate structures — see `custom_price_inr_per_kwh` above.
+_TARIFF_PRESETS_24H: Dict[str, np.ndarray] = {
+    # Night off-peak: INR 5.5/kWh | Day: INR 8.0/kWh | Solar valley (10-15): INR 6.5/kWh | Evening peak (18-22): INR 12.5/kWh
+    "normal_tou": np.array([
+        5.5, 5.5, 5.5, 5.5, 5.5, 5.5,     # 00:00 - 05:00
+        8.0, 8.0, 8.0, 8.0, 6.5, 6.5,     # 06:00 - 11:00
+        6.5, 6.5, 6.5, 8.0, 8.0, 8.0,     # 12:00 - 17:00
+        12.5, 12.5, 12.5, 12.5, 8.0, 5.5  # 18:00 - 23:00 (18:00-21:59 peak)
+    ], dtype=float),
+    "flat": np.full(24, 8.0, dtype=float),
+    # Extreme evening peak stress tariff (INR 18.0/kWh during 18:00 - 21:59)
+    "high_evening": np.array([
+        5.5, 5.5, 5.5, 5.5, 5.5, 5.5,
+        8.0, 8.0, 8.0, 8.0, 6.5, 6.5,
+        6.5, 6.5, 6.5, 8.0, 8.0, 9.0,
+        18.0, 18.0, 18.0, 18.0, 9.0, 5.5
+    ], dtype=float),
+}
+
+
+def get_tariff_preset(price_regime: str, hours: int = 24) -> np.ndarray:
+    """
+    Return a built-in hourly tariff array (INR/kWh) by name.
+
+    These three presets ('normal_tou', 'flat', 'high_evening') are provided
+    as convenient, clearly-labeled starting points only. For a real or
+    different hypothetical tariff, pass an hourly array directly to
+    ``generate_synthetic_commercial_profiles(custom_price_inr_per_kwh=...)``
+    or ``optimize_building_dispatch(price_inr_per_kwh=...)`` instead of being
+    limited to these three fixed rate structures.
+    """
+    if hours != 24:
+        raise ValueError("Built-in tariff presets currently only support a 24-hour horizon.")
+    if price_regime not in _TARIFF_PRESETS_24H:
+        raise ValueError(
+            f"Unknown price_regime '{price_regime}'. Use one of {sorted(_TARIFF_PRESETS_24H)}, "
+            "or supply custom_price_inr_per_kwh for any other tariff."
+        )
+    return _TARIFF_PRESETS_24H[price_regime].copy()
+
+
+def validate_custom_tariff(price_inr_per_kwh: Sequence[float], hours: int = 24) -> np.ndarray:
+    """
+    Validate a user-supplied hourly electricity tariff (INR/kWh).
+
+    A custom tariff may come from a real DISCOM bill, a different state's
+    rate schedule, or any hypothetical rate structure the user wants to
+    stress-test — it is not limited to the three built-in presets. This
+    function only checks structural/physical sanity (length, finiteness,
+    non-negativity); it intentionally does not restrict which rates are
+    allowed, since real tariffs vary widely by state, consumer category,
+    and regulatory revision.
+    """
+    price = np.asarray(price_inr_per_kwh, dtype=float).flatten()
+    if len(price) != hours:
+        raise ValueError(
+            f"Custom tariff must have exactly {hours} hourly values (got {len(price)})."
+        )
+    if not np.all(np.isfinite(price)):
+        raise ValueError("Custom tariff values must all be finite numbers.")
+    if (price < 0).any():
+        raise ValueError("Custom tariff values (INR/kWh) must be non-negative.")
+    return price
+
+
+def _build_profile_frame(hours: int, solar_scale: float, price_inr_per_kwh: np.ndarray) -> pd.DataFrame:
+    """Assemble the standard synthetic demand/solar/tariff DataFrame for a given tariff array."""
+    hour_idx = np.arange(hours, dtype=int)
+    demand_kwh = _DEMAND_KWH_24H
+    solar_kwh = np.maximum(0.0, _BASE_SOLAR_KWH_24H * float(solar_scale))
 
     return pd.DataFrame({
         "hour": hour_idx,
         "demand_kwh": demand_kwh,
         "solar_kwh": solar_kwh,
-        "price_inr_per_kwh": price_inr,
+        "price_inr_per_kwh": np.asarray(price_inr_per_kwh, dtype=float),
         "data_label": "SYNTHETIC_COMMERCIAL_PROFILE",
     })
 

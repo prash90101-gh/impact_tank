@@ -12,6 +12,8 @@ from .energy_model import (
     compute_baseline_dispatch,
     generate_synthetic_commercial_profiles,
     get_scenario_definitions,
+    get_tariff_preset,
+    validate_custom_tariff,
     validate_physical_schedule,
 )
 from .optimizer import (
@@ -25,6 +27,8 @@ __all__ = [
     "compute_baseline_dispatch",
     "generate_synthetic_commercial_profiles",
     "get_scenario_definitions",
+    "get_tariff_preset",
+    "validate_custom_tariff",
     "validate_physical_schedule",
     "optimize_building_dispatch",
     "run_all_scenarios",

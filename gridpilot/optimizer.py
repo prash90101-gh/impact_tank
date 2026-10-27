@@ -49,7 +49,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linprog
 
-from energy_model import (
+from .energy_model import (
     BatteryConfig,
     compute_baseline_dispatch,
     get_scenario_definitions,

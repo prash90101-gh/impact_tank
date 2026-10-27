@@ -7,13 +7,13 @@ engine (energy_model.py and optimizer.py).
 
 import unittest
 import numpy as np
-from energy_model import (
+from gridpilot.energy_model import (
     BatteryConfig,
     generate_synthetic_commercial_profiles,
     get_scenario_definitions,
     validate_physical_schedule,
 )
-from optimizer import (
+from gridpilot.optimizer import (
     optimize_building_dispatch,
     run_all_scenarios,
     run_scenario,
